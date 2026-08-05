@@ -83,7 +83,7 @@ Before running VPN Finder, ensure you have the following installed:
 
 3.  **Make the script executable (optional but recommended):**
     ```bash
-    chmod +x vpn_recon.py
+    chmod +x vpn-finder.py
     ```
 
 4.  **Verify Prerequisites:** Confirm `ffuf` and `nmap` are installed and accessible:
