@@ -100,4 +100,4 @@ Run the script from your terminal using `python3` or by directly executing it if
 
 **Basic Command:**
 ```bash
-sudo pyhton3 vpn_finder.py <target_domain>
+pyhton3 vpn_finder.py <target_domain>
