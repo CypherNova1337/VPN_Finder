@@ -71,8 +71,8 @@ Before running VPN Finder, ensure you have the following installed:
 
 1.  **Clone the repository (if applicable) or download the script (`VPN_Finder.py`).**
     ```bash
-    # git clone [https://github.com/cyphernova1337/VPN_Finder.git](https://github.com/cyphernova1337/VPN_Finder.git)
-    # cd VPN_Finder
+     git clone https://github.com/cyphernova1337/VPN_Finder.git
+     cd VPN_Finder
     ```
 
 2.  **Create the `requirements.txt` file** (as provided above) in the same directory as the script and install the Python dependencies:
