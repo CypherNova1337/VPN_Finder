@@ -24,8 +24,6 @@ address** — through non-proxied subdomain leaks, historical/passive DNS, mail
 (MX/SPF) infrastructure, TLS-certificate and favicon pivoting, and direct
 origin verification — so the edge IP is never the end of the trail.
 
----
-
 ## 📜 Why this tool
 
 Most subdomain tools stop at "here's a list of hosts." VPN Finder is built for
@@ -203,16 +201,6 @@ additional pivoting sources:
   Known CVEs for this product (verify version!):
     ! CVE-2018-13379 (pre-auth arbitrary file read)
     ! CVE-2024-21762 (pre-auth RCE)
-
-==================== ORIGIN DISCOVERY ====================
-  www.company.com  (behind Cloudflare)
-    CONFIRMED ORIGIN: 203.0.113.44  [score 100]  AS64500 Example Telecom
-        found via : mail infrastructure (MX/SPF), passive/historical DNS
-        + origin certificate covers the target domain
-        + served page is byte-identical to the CDN response
-```
-
----
 
 ## 🌍 Environment variables
 
