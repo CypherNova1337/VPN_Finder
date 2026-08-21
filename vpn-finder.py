@@ -15,9 +15,15 @@ import csv
 import json
 import os
 import re
+import base64
+import functools
+import hashlib
+import ipaddress
+import random
 import shutil
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -69,7 +75,7 @@ try:
 except Exception:
     pass
 
-SCRIPT_VERSION = "2.0"
+SCRIPT_VERSION = "2.1"
 SCRIPT_AUTHORS = "Cyphernova1337, VoidSec-Hub"
 DEFAULT_USER_AGENT = f"Mozilla/5.0 (compatible; VPNFinder/{SCRIPT_VERSION})"
 
@@ -703,6 +709,797 @@ def nmap_service_scan(ip, ports):
     return services
 
 
+# =========================================================================== #
+#  CDN detection & origin-IP discovery engine
+#
+#  When a target hides its real infrastructure behind a CDN/WAF (Cloudflare,
+#  CloudFront, Akamai, Fastly, Imperva, Sucuri, ...), the edge IP tells you
+#  nothing. This engine works to recover the true origin IP address by every
+#  passive/active means available:
+#    * a built-in keyless DNS client (A/AAAA/CNAME/MX/TXT/NS)
+#    * Team Cymru IP->ASN mapping (keyless) to label and cluster IPs
+#    * non-proxied subdomain harvesting (mail/dev/direct/origin leaks)
+#    * historical / passive DNS records that predate the CDN
+#    * MX and SPF mail infrastructure (often on the origin network)
+#    * TLS-certificate and favicon pivoting via Shodan/Censys (if keys set)
+#    * direct origin verification (Host-header + SNI request, content/cert match)
+#    * optional ASN/netblock sweeping around confirmed origins
+# =========================================================================== #
+
+# --- Minimal keyless DNS client (UDP) ------------------------------------- #
+_DNS_QTYPES = {"A": 1, "NS": 2, "CNAME": 5, "SOA": 6, "PTR": 12, "MX": 15,
+               "TXT": 16, "AAAA": 28}
+DNS_RESOLVERS = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
+
+
+def _dns_encode_name(name):
+    out = b""
+    for label in name.rstrip(".").split("."):
+        label = label.encode("idna") if any(ord(c) > 127 for c in label) \
+            else label.encode("latin-1")
+        out += bytes([len(label)]) + label
+    return out + b"\x00"
+
+
+def _dns_parse_name(data, offset):
+    labels = []
+    jumped = False
+    start_after = offset
+    for _ in range(128):  # bound the loop against malformed packets
+        length = data[offset]
+        if length & 0xC0 == 0xC0:
+            pointer = ((length & 0x3F) << 8) | data[offset + 1]
+            if not jumped:
+                start_after = offset + 2
+            offset = pointer
+            jumped = True
+            continue
+        if length == 0:
+            offset += 1
+            break
+        labels.append(data[offset + 1:offset + 1 + length].decode("latin-1"))
+        offset += 1 + length
+    return ".".join(labels), (start_after if jumped else offset)
+
+
+def _dns_tcp_query(resolver, packet, timeout):
+    """Fallback for truncated responses: DNS over TCP (2-byte length prefix)."""
+    try:
+        with socket.create_connection((resolver, 53), timeout=timeout) as s:
+            s.sendall(struct.pack(">H", len(packet)) + packet)
+            hdr = b""
+            while len(hdr) < 2:
+                chunk = s.recv(2 - len(hdr))
+                if not chunk:
+                    return None
+                hdr += chunk
+            need = struct.unpack(">H", hdr)[0]
+            data = b""
+            while len(data) < need:
+                chunk = s.recv(need - len(data))
+                if not chunk:
+                    break
+                data += chunk
+            return data
+    except Exception:
+        return None
+
+
+# DNS-over-HTTPS endpoints (JSON API). Used when UDP is blocked/truncated and
+# TCP/53 is unavailable - works anywhere outbound HTTPS is allowed.
+_DOH_ENDPOINTS = ["https://dns.google/resolve",
+                  "https://cloudflare-dns.com/dns-query"]
+
+
+def _doh_query(name, qtype):
+    for url in _DOH_ENDPOINTS:
+        try:
+            r = requests.get(url, params={"name": name, "type": qtype},
+                             headers={"Accept": "application/dns-json"},
+                             timeout=8)
+            if r.status_code != 200:
+                continue
+            answers = r.json().get("Answer", [])
+        except Exception:
+            continue
+        results = []
+        for ans in answers:
+            atype = ans.get("type")
+            data = (ans.get("data") or "").strip()
+            if atype == 1:
+                results.append(data)
+            elif atype == 28:
+                results.append(data)
+            elif atype in (5, 2, 12):  # CNAME / NS / PTR
+                results.append(data.rstrip(".").lower())
+            elif atype == 15:  # MX: "10 smtp.example.com."
+                parts = data.split(None, 1)
+                if len(parts) == 2 and parts[0].isdigit():
+                    results.append((int(parts[0]), parts[1].rstrip(".").lower()))
+            elif atype == 16:  # TXT (quoted, possibly concatenated)
+                results.append(data.strip('"').replace('" "', ""))
+        if results:
+            return results
+    return []
+
+
+@functools.lru_cache(maxsize=4096)
+def dns_query(name, qtype="A", timeout=4.0):
+    """Resolve a DNS record with the built-in client. Returns a list.
+
+    Uses UDP first and transparently retries over TCP when the response is
+    truncated (TC bit) - important for large TXT/SPF records."""
+    qt = _DNS_QTYPES.get(qtype.upper())
+    if qt is None:
+        return []
+    tid = random.randint(0, 0xFFFF)
+    packet = (struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+              + _dns_encode_name(name) + struct.pack(">HH", qt, 1))
+    data = None
+    used_resolver = None
+    for resolver in DNS_RESOLVERS:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(timeout)
+            s.sendto(packet, (resolver, 53))
+            data, _ = s.recvfrom(4096)
+            s.close()
+            used_resolver = resolver
+            break
+        except Exception:
+            try:
+                s.close()
+            except Exception:
+                pass
+            continue
+    if not data or len(data) < 12:
+        return _doh_query(name, qtype.upper())
+    rtid, flags, qd, an, _ns, _ar = struct.unpack(">HHHHHH", data[:12])
+    if rtid != tid:
+        return _doh_query(name, qtype.upper())
+    if flags & 0x0200:  # TC (truncated): try TCP, then DoH over HTTPS
+        tcp_data = _dns_tcp_query(used_resolver, packet, timeout) \
+            if used_resolver else None
+        if tcp_data and len(tcp_data) >= 12:
+            data = tcp_data
+            rtid, flags, qd, an, _ns, _ar = struct.unpack(">HHHHHH", data[:12])
+            if rtid != tid:
+                return []
+        else:
+            doh = _doh_query(name, qtype.upper())
+            if doh:
+                return doh
+    offset = 12
+    for _ in range(qd):
+        _, offset = _dns_parse_name(data, offset)
+        offset += 4
+    results = []
+    try:
+        for _ in range(an):
+            _, offset = _dns_parse_name(data, offset)
+            rtype, _rclass, _ttl, rdlength = struct.unpack(
+                ">HHIH", data[offset:offset + 10])
+            offset += 10
+            rdata = data[offset:offset + rdlength]
+            if rtype == 1 and rdlength == 4:
+                results.append(socket.inet_ntoa(rdata))
+            elif rtype == 28 and rdlength == 16:
+                results.append(socket.inet_ntop(socket.AF_INET6, rdata))
+            elif rtype in (5, 2, 12):  # CNAME / NS / PTR
+                nm, _ = _dns_parse_name(data, offset)
+                results.append(nm.lower())
+            elif rtype == 15:  # MX
+                pref = struct.unpack(">H", rdata[:2])[0]
+                nm, _ = _dns_parse_name(data, offset + 2)
+                results.append((pref, nm.lower()))
+            elif rtype == 16:  # TXT
+                txt, i = [], 0
+                while i < rdlength:
+                    ln = rdata[i]
+                    txt.append(rdata[i + 1:i + 1 + ln].decode("latin-1"))
+                    i += 1 + ln
+                results.append("".join(txt))
+            offset += rdlength
+    except Exception:
+        pass
+    return results
+
+
+def cname_chain(host, max_depth=8):
+    """Follow the CNAME chain for a host, returning all intermediate names."""
+    chain, current, seen = [], host, set()
+    for _ in range(max_depth):
+        if current in seen:
+            break
+        seen.add(current)
+        cnames = [r for r in dns_query(current, "CNAME") if isinstance(r, str)]
+        if not cnames:
+            break
+        current = cnames[0]
+        chain.append(current)
+    return chain
+
+
+# --- Team Cymru IP -> ASN (keyless) --------------------------------------- #
+@functools.lru_cache(maxsize=4096)
+def ip_to_asn(ip):
+    """Map an IPv4/IPv6 address to its ASN, CIDR and org via Team Cymru DNS."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    if addr.version == 4:
+        rev = ".".join(reversed(ip.split("."))) + ".origin.asn.cymru.com"
+    else:
+        nibbles = "".join(reversed(addr.exploded.replace(":", "")))
+        rev = ".".join(nibbles) + ".origin6.asn.cymru.com"
+    txt = [t for t in dns_query(rev, "TXT") if isinstance(t, str)]
+    if not txt:
+        return None
+    parts = [p.strip() for p in txt[0].split("|")]
+    if not parts or not parts[0]:
+        return None
+    asn = parts[0].split()[0]
+    info = {"asn": asn, "cidr": parts[1] if len(parts) > 1 else "",
+            "cc": parts[2] if len(parts) > 2 else "", "org": ""}
+    name_txt = [t for t in dns_query(f"AS{asn}.asn.cymru.com", "TXT")
+                if isinstance(t, str)]
+    if name_txt:
+        info["org"] = name_txt[0].split("|")[-1].strip()
+    return info
+
+
+# --- CDN / WAF fingerprints ----------------------------------------------- #
+CDN_CNAME_SIGNS = {
+    "cloudflare": "Cloudflare", "cloudflare.net": "Cloudflare",
+    "cloudfront.net": "Amazon CloudFront", "awsdns": "AWS",
+    "akamai": "Akamai", "akamaiedge.net": "Akamai", "akamaized.net": "Akamai",
+    "edgekey.net": "Akamai", "edgesuite.net": "Akamai",
+    "fastly.net": "Fastly", "fastlylb.net": "Fastly",
+    "azureedge.net": "Azure CDN", "azurefd.net": "Azure Front Door",
+    "trafficmanager.net": "Azure", "incapdns.net": "Imperva Incapsula",
+    "impervadns.net": "Imperva", "sucuri.net": "Sucuri",
+    "edgecastcdn.net": "Edgecast", "stackpathdns.com": "StackPath",
+    "stackpathcdn.com": "StackPath", "cdn77.org": "CDN77",
+    "b-cdn.net": "BunnyCDN", "googlehosted.com": "Google",
+    "ghs.googlehosted.com": "Google", "cachefly.net": "CacheFly",
+    "kxcdn.com": "KeyCDN", "footprint.net": "CenturyLink", "llnwd.net": "Limelight",
+}
+CDN_HEADER_SIGNS = [
+    ("server", r"cloudflare", "Cloudflare"),
+    ("cf-ray", r".", "Cloudflare"),
+    ("server", r"cloudfront", "Amazon CloudFront"),
+    ("x-amz-cf-id", r".", "Amazon CloudFront"),
+    ("server", r"AkamaiGHost|AkamaiNetStorage", "Akamai"),
+    ("x-akamai-transformed", r".", "Akamai"),
+    ("server", r"^ECS|^ECAcc|Fastly", "Fastly"),
+    ("x-served-by", r"cache-", "Fastly"),
+    ("x-fastly-request-id", r".", "Fastly"),
+    ("x-sucuri-id", r".", "Sucuri"),
+    ("x-cdn", r"Incapsula|Imperva", "Imperva Incapsula"),
+    ("x-iinfo", r".", "Imperva Incapsula"),
+    ("x-cache", r"cloudfront", "Amazon CloudFront"),
+    ("server", r"StackPath", "StackPath"),
+    ("x-hw", r".", "StackPath"),
+    ("server", r"BunnyCDN", "BunnyCDN"),
+]
+_CDN_HEADER_RE = [(h, re.compile(p, re.I), name) for h, p, name in CDN_HEADER_SIGNS]
+# ASN org substrings that indicate CDN/WAF/edge networks (not real origins).
+CDN_ASN_KEYWORDS = {
+    "cloudflare": "Cloudflare", "amazon": "AWS/CloudFront",
+    "akamai": "Akamai", "fastly": "Fastly", "incapsula": "Imperva Incapsula",
+    "imperva": "Imperva", "sucuri": "Sucuri", "google": "Google",
+    "microsoft": "Azure", "azure": "Azure", "stackpath": "StackPath",
+    "highwinds": "StackPath", "edgecast": "Edgecast", "verizon": "Edgecast",
+    "limelight": "Limelight", "cdn77": "CDN77", "bunny": "BunnyCDN",
+    "cloudfront": "Amazon CloudFront", "gcore": "Gcore", "keycdn": "KeyCDN",
+    "fdcservers": "CDN", "quantil": "Quantil", "cachefly": "CacheFly",
+}
+
+
+def cdn_from_asn(asn_info):
+    if not asn_info:
+        return None
+    org = (asn_info.get("org") or "").lower()
+    for kw, name in CDN_ASN_KEYWORDS.items():
+        if kw in org:
+            return name
+    return None
+
+
+def detect_cdn(host, ips, response_headers=None):
+    """Return the CDN/WAF name fronting a host, or None. Uses CNAME chain,
+    response headers, and ASN of the resolved IPs."""
+    for cn in cname_chain(host):
+        for sign, name in CDN_CNAME_SIGNS.items():
+            if sign in cn:
+                return name
+    if response_headers:
+        for hdr, rx, name in _CDN_HEADER_RE:
+            val = response_headers.get(hdr, "")
+            if val and rx.search(val):
+                return name
+    for ip in ips:
+        cdn = cdn_from_asn(ip_to_asn(ip))
+        if cdn:
+            return cdn
+    return None
+
+
+def is_cdn_ip(ip):
+    return cdn_from_asn(ip_to_asn(ip)) is not None
+
+
+# --- Direct origin verification ------------------------------------------- #
+def _page_signature(body):
+    m = _TITLE_RE.search(body)
+    title = (m.group(1).strip() if m else "")[:120]
+    norm = re.sub(r"\s+", " ", body).strip().lower()
+    return {"title": title, "length": len(body),
+            "hash": hashlib.sha256(norm.encode("utf-8", "ignore")).hexdigest()}
+
+
+def direct_request(ip, host, port=443, path="/", timeout=6.0):
+    """Connect straight to an IP, presenting `host` via SNI and Host header.
+    This is how a candidate origin is tested behind a CDN."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.set_ciphers("DEFAULT:@SECLEVEL=0")
+    except Exception:
+        pass
+    result = {"status": None, "headers": {}, "body": "", "cert_sha256": None,
+              "cert_raw": ""}
+    try:
+        raw = socket.create_connection((ip, port), timeout=timeout)
+    except Exception:
+        return None
+    try:
+        ss = ctx.wrap_socket(raw, server_hostname=host)
+    except Exception:
+        try:
+            raw.close()
+        except Exception:
+            pass
+        return None
+    try:
+        der = ss.getpeercert(binary_form=True)
+        if der:
+            result["cert_sha256"] = hashlib.sha256(der).hexdigest()
+            result["cert_raw"] = der.decode("latin-1", "ignore")
+        req = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
+               f"User-Agent: {DEFAULT_USER_AGENT}\r\n"
+               f"Accept: */*\r\nAccept-Encoding: identity\r\n"
+               f"Connection: close\r\n\r\n")
+        ss.sendall(req.encode("latin-1"))
+        buf = b""
+        while len(buf) < 262144:
+            chunk = ss.recv(8192)
+            if not chunk:
+                break
+            buf += chunk
+    except Exception:
+        buf = b""
+    finally:
+        try:
+            ss.close()
+        except Exception:
+            pass
+    head, _, body = buf.partition(b"\r\n\r\n")
+    hlines = head.decode("latin-1", "ignore").split("\r\n")
+    if hlines and hlines[0].startswith("HTTP"):
+        parts = hlines[0].split(" ", 2)
+        if len(parts) >= 2 and parts[1].isdigit():
+            result["status"] = int(parts[1])
+    for line in hlines[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            result["headers"][k.strip().lower()] = v.strip()
+    if "chunked" in result["headers"].get("transfer-encoding", "").lower():
+        body = _dechunk(body)
+    result["body"] = body.decode("utf-8", "ignore")
+    return result
+
+
+def _dechunk(data):
+    """Decode an HTTP/1.1 chunked transfer-encoded body."""
+    out, i, n = b"", 0, len(data)
+    try:
+        while i < n:
+            j = data.find(b"\r\n", i)
+            if j == -1:
+                break
+            size = int(data[i:j].split(b";")[0], 16)
+            if size == 0:
+                break
+            start = j + 2
+            out += data[start:start + size]
+            i = start + size + 2
+    except Exception:
+        return data
+    return out
+
+
+def verify_origin(ip, host, reference, timeout):
+    """Score whether `ip` is the true origin for `host`. Returns
+    (verified: bool, score: int, reasons: list)."""
+    resp = direct_request(ip, host, 443, "/", timeout)
+    if resp is None:
+        return False, 0, ["no HTTPS response"]
+    score, reasons = 0, []
+
+    if resp["cert_sha256"] and resp["cert_sha256"] == reference.get("cert_sha256"):
+        score += 60
+        reasons.append("TLS certificate is identical to the edge")
+    # Cert covers the target domain (origin commonly serves the real cert).
+    apex = reference.get("domain", host)
+    if resp["cert_raw"] and (host in resp["cert_raw"] or apex in resp["cert_raw"]):
+        score += 40
+        reasons.append("origin certificate covers the target domain")
+
+    ref_sig = reference.get("signature")
+    if ref_sig and resp["body"]:
+        sig = _page_signature(resp["body"])
+        if sig["hash"] == ref_sig["hash"]:
+            score += 60
+            reasons.append("served page is byte-identical to the CDN response")
+        elif ref_sig["title"] and sig["title"] == ref_sig["title"]:
+            score += 45
+            reasons.append(f"page title matches ('{sig['title'][:40]}')")
+        elif (ref_sig["length"] and sig["length"] and
+              abs(sig["length"] - ref_sig["length"]) / max(ref_sig["length"], 1) < 0.15):
+            score += 20
+            reasons.append("response body size closely matches")
+
+    marker = reference.get("marker")
+    if marker and marker in resp["body"]:
+        score += 35
+        reasons.append("origin response contains a unique target marker")
+
+    return (score >= 50), min(score, 100), reasons
+
+
+def build_origin_reference(session, host, domain, timeout):
+    """Fetch the CDN-fronted response and derive a fingerprint used to confirm
+    candidate origins."""
+    ref = {"domain": domain, "cert_sha256": None, "signature": None,
+           "marker": None}
+    try:
+        r = session.get(f"https://{host}/", timeout=timeout, verify=False)
+        ref["signature"] = _page_signature(r.text)
+        # A stable, target-specific marker: canonical/og:url/domain mentions.
+        m = re.search(r'(?:canonical|og:url)["\']?[^"\']*["\']([^"\']*'
+                      + re.escape(domain) + r'[^"\']*)', r.text, re.I)
+        if m:
+            ref["marker"] = m.group(1)[:80]
+    except Exception:
+        pass
+    # Real edge cert fingerprint for exact-match comparison.
+    edge = direct_request(_first_ip(host) or host, host, 443, "/", timeout)
+    if edge and edge.get("cert_sha256"):
+        ref["cert_sha256"] = edge["cert_sha256"]
+    return ref
+
+
+def _first_ip(host):
+    ips = resolve_host(host)
+    return ips[0] if ips else None
+
+
+# --- Favicon hashing (Shodan-compatible murmur3) -------------------------- #
+def _murmur3_32(data, seed=0):
+    c1, c2 = 0xCC9E2D51, 0x1B873593
+    length = len(data)
+    h1 = seed
+    rounded = length & 0xFFFFFFFC
+    for i in range(0, rounded, 4):
+        k1 = (data[i] | (data[i + 1] << 8) | (data[i + 2] << 16)
+              | (data[i + 3] << 24)) & 0xFFFFFFFF
+        k1 = (k1 * c1) & 0xFFFFFFFF
+        k1 = ((k1 << 15) | (k1 >> 17)) & 0xFFFFFFFF
+        k1 = (k1 * c2) & 0xFFFFFFFF
+        h1 ^= k1
+        h1 = ((h1 << 13) | (h1 >> 19)) & 0xFFFFFFFF
+        h1 = (h1 * 5 + 0xE6546B64) & 0xFFFFFFFF
+    k1 = 0
+    tail = length & 3
+    if tail == 3:
+        k1 ^= data[rounded + 2] << 16
+    if tail >= 2:
+        k1 ^= data[rounded + 1] << 8
+    if tail >= 1:
+        k1 ^= data[rounded]
+        k1 = (k1 * c1) & 0xFFFFFFFF
+        k1 = ((k1 << 15) | (k1 >> 17)) & 0xFFFFFFFF
+        k1 = (k1 * c2) & 0xFFFFFFFF
+        h1 ^= k1
+    h1 ^= length
+    h1 ^= h1 >> 16
+    h1 = (h1 * 0x85EBCA6B) & 0xFFFFFFFF
+    h1 ^= h1 >> 13
+    h1 = (h1 * 0xC2B2AE35) & 0xFFFFFFFF
+    h1 ^= h1 >> 16
+    return h1 - 0x100000000 if h1 & 0x80000000 else h1
+
+
+def favicon_hash(session, base_url, timeout):
+    try:
+        r = session.get(base_url + "/favicon.ico", timeout=timeout, verify=False)
+        if r.status_code != 200 or not r.content:
+            return None
+        return _murmur3_32(base64.encodebytes(r.content))
+    except Exception:
+        return None
+
+
+# --- Optional external intel sources (activated by env API keys) ---------- #
+def shodan_search(session, query, timeout=25):
+    key = os.getenv("SHODAN_API_KEY")
+    if not key:
+        return []
+    try:
+        r = session.get("https://api.shodan.io/shodan/host/search",
+                        params={"key": key, "query": query}, timeout=timeout)
+        if r.status_code != 200:
+            return []
+        return [m["ip_str"] for m in r.json().get("matches", []) if m.get("ip_str")]
+    except Exception:
+        return []
+
+
+def censys_search(session, domain, timeout=25):
+    cid = os.getenv("CENSYS_API_ID")
+    secret = os.getenv("CENSYS_API_SECRET")
+    if not (cid and secret):
+        return []
+    try:
+        r = session.post(
+            "https://search.censys.io/api/v2/hosts/search",
+            auth=(cid, secret), timeout=timeout,
+            json={"q": f"services.tls.certificates.leaf_data.names: {domain}",
+                  "per_page": 50})
+        if r.status_code != 200:
+            return []
+        hits = r.json().get("result", {}).get("hits", [])
+        return [h["ip"] for h in hits if h.get("ip")]
+    except Exception:
+        return []
+
+
+def securitytrails_history(session, domain, timeout=25):
+    key = os.getenv("SECURITYTRAILS_API_KEY")
+    if not key:
+        return []
+    ips = []
+    try:
+        r = session.get(
+            f"https://api.securitytrails.com/v1/history/{domain}/dns/a",
+            headers={"APIKEY": key}, timeout=timeout)
+        if r.status_code == 200:
+            for rec in r.json().get("records", []):
+                for v in rec.get("values", []):
+                    if v.get("ip"):
+                        ips.append(v["ip"])
+    except Exception:
+        pass
+    return ips
+
+
+# --- Historical / passive DNS (keyless) ----------------------------------- #
+def passive_historical_ips(session, domain, timeout=25):
+    ips = set()
+    # AlienVault OTX passive DNS - includes historical A records.
+    try:
+        r = session.get(f"https://otx.alienvault.com/api/v1/indicators/"
+                        f"domain/{domain}/passive_dns", timeout=timeout)
+        if r.status_code == 200:
+            for rec in r.json().get("passive_dns", []):
+                addr = rec.get("address", "")
+                if addr and _is_ipv4(addr):
+                    ips.add(addr)
+    except Exception:
+        pass
+    # HackerTarget reverse/host records.
+    try:
+        r = session.get(f"https://api.hackertarget.com/hostsearch/?q={domain}",
+                        timeout=timeout)
+        if r.status_code == 200 and "error" not in r.text.lower():
+            for line in r.text.splitlines():
+                if "," in line:
+                    ip = line.split(",", 1)[1].strip()
+                    if _is_ipv4(ip):
+                        ips.add(ip)
+    except Exception:
+        pass
+    return ips
+
+
+def _is_ipv4(value):
+    try:
+        return ipaddress.ip_address(value).version == 4
+    except ValueError:
+        return False
+
+
+def mail_infra_ips(domain):
+    """MX hosts and SPF ip4 blocks - mail servers frequently live on the
+    origin network, outside the CDN."""
+    ips = set()
+    for pref, mx in [r for r in dns_query(domain, "MX") if isinstance(r, tuple)]:
+        for ip in dns_query(mx.rstrip("."), "A"):
+            if isinstance(ip, str) and _is_ipv4(ip):
+                ips.add(ip)
+    for txt in [t for t in dns_query(domain, "TXT") if isinstance(t, str)]:
+        if "v=spf1" in txt.lower():
+            for tok in txt.split():
+                if tok.startswith("ip4:"):
+                    net = tok[4:]
+                    try:
+                        network = ipaddress.ip_network(net, strict=False)
+                        if network.num_addresses <= 256:
+                            ips.update(str(h) for h in network.hosts())
+                        else:
+                            ips.add(str(network.network_address))
+                    except ValueError:
+                        pass
+                elif tok.startswith("include:") or tok.startswith("a:"):
+                    hostpart = tok.split(":", 1)[1]
+                    for ip in dns_query(hostpart, "A"):
+                        if isinstance(ip, str) and _is_ipv4(ip):
+                            ips.add(ip)
+    return ips
+
+
+def gather_origin_candidates(session, domain, resolved, args):
+    """Assemble candidate origin IPs (with their discovery method) from every
+    available source, excluding known-CDN addresses."""
+    candidates = {}  # ip -> set(methods)
+
+    def add(ip, method):
+        if _is_ipv4(ip) and not _is_private(ip):
+            candidates.setdefault(ip, set()).add(method)
+
+    # 1. Non-proxied subdomains already resolved.
+    for host, ips in resolved.items():
+        for ip in ips:
+            if _is_ipv4(ip) and not is_cdn_ip(ip):
+                add(ip, f"non-proxied subdomain ({host})")
+
+    # 2. Historical / passive DNS.
+    for ip in passive_historical_ips(session, domain):
+        add(ip, "passive/historical DNS")
+
+    # 3. Mail infrastructure (MX / SPF).
+    for ip in mail_infra_ips(domain):
+        add(ip, "mail infrastructure (MX/SPF)")
+
+    # 4. External intel (only if API keys present).
+    for ip in shodan_search(session, f'ssl:"{domain}"'):
+        add(ip, "Shodan cert/hostname pivot")
+    for ip in censys_search(session, domain):
+        add(ip, "Censys certificate pivot")
+    for ip in securitytrails_history(session, domain):
+        add(ip, "SecurityTrails DNS history")
+
+    # 5. Favicon pivot via Shodan (if key + favicon available).
+    fh = favicon_hash(session, f"https://{domain}", args.timeout)
+    if fh is not None:
+        for ip in shodan_search(session, f"http.favicon.hash:{fh}"):
+            add(ip, f"Shodan favicon pivot (hash={fh})")
+
+    # Drop CDN-network candidates that slipped through intel sources.
+    for ip in list(candidates):
+        if is_cdn_ip(ip):
+            del candidates[ip]
+    return candidates
+
+
+def _is_private(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+        return a.is_private or a.is_loopback or a.is_reserved or a.is_link_local
+    except ValueError:
+        return True
+
+
+def asn_sweep_candidates(confirmed_origins, cap=1024):
+    """Expand confirmed origins to their surrounding /24 (and the Cymru CIDR
+    when small) for an optional netblock sweep."""
+    targets = set()
+    for ip in confirmed_origins:
+        info = ip_to_asn(ip)
+        cidr = info.get("cidr") if info else ""
+        added = False
+        if cidr:
+            try:
+                net = ipaddress.ip_network(cidr, strict=False)
+                if net.num_addresses <= cap:
+                    targets.update(str(h) for h in net.hosts())
+                    added = True
+            except ValueError:
+                pass
+        if not added:
+            try:
+                net = ipaddress.ip_network(ip + "/24", strict=False)
+                targets.update(str(h) for h in net.hosts())
+            except ValueError:
+                pass
+    return targets
+
+
+def origin_discovery(session, domain, targets_hosts, resolved, args):
+    """Full origin-IP recovery workflow for CDN-fronted hosts.
+
+    Returns a dict: {host: {"cdn": name, "reference": {...},
+                            "origins": [ {ip, verified, score, methods,
+                                          reasons, asn} ]}}."""
+    findings = {}
+    for host in targets_hosts:
+        ips = resolved.get(host) or resolve_host(host) or []
+        cdn = detect_cdn(host, ips)
+        if not cdn and not args.force_origin:
+            continue  # not fronted; the resolved IP is already the origin
+        info(f"CDN/WAF on {C.CYAN}{host}{C.ENDC}: "
+             f"{C.YELLOW}{cdn or 'unknown'}{C.ENDC} - hunting origin IP...")
+        reference = build_origin_reference(session, host, domain, args.timeout)
+        candidates = gather_origin_candidates(session, domain, resolved, args)
+        info(f"  {C.BOLD}{len(candidates)}{C.ENDC} candidate origin IP(s) to verify.")
+
+        origins = []
+        workers = max(1, min(args.threads, 20))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            fut = {ex.submit(verify_origin, ip, host, reference, args.timeout): ip
+                   for ip in candidates}
+            for f in concurrent.futures.as_completed(fut):
+                ip = fut[f]
+                try:
+                    verified, score, reasons = f.result()
+                except Exception:
+                    continue
+                if verified or score >= 20:
+                    asn = ip_to_asn(ip)
+                    rec = {"ip": ip, "verified": verified, "score": score,
+                           "methods": sorted(candidates[ip]), "reasons": reasons,
+                           "asn": asn}
+                    origins.append(rec)
+                    tag = (f"{C.GREEN}CONFIRMED{C.ENDC}" if verified
+                           else f"{C.YELLOW}possible{C.ENDC}")
+                    org = f" [{asn['asn']} {asn['org'][:30]}]" if asn else ""
+                    good(f"  origin {tag}: {C.CYAN}{ip}{C.ENDC}{org} "
+                         f"(score {score})")
+
+        # Optional ASN/netblock sweep around confirmed origins.
+        confirmed_ips = [o["ip"] for o in origins if o["verified"]]
+        if args.asn_sweep and confirmed_ips:
+            sweep = asn_sweep_candidates(confirmed_ips, cap=args.sweep_cap)
+            sweep -= set(candidates)
+            info(f"  ASN sweep: verifying {C.BOLD}{len(sweep)}{C.ENDC} "
+                 f"neighbouring IPs...")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.threads, 40)) as ex:
+                fut = {ex.submit(verify_origin, ip, host, reference, args.timeout): ip
+                       for ip in sweep}
+                for f in concurrent.futures.as_completed(fut):
+                    ip = fut[f]
+                    try:
+                        verified, score, reasons = f.result()
+                    except Exception:
+                        continue
+                    if verified:
+                        asn = ip_to_asn(ip)
+                        origins.append({"ip": ip, "verified": True,
+                                        "score": score,
+                                        "methods": ["ASN/netblock sweep"],
+                                        "reasons": reasons, "asn": asn})
+                        good(f"  origin {C.GREEN}CONFIRMED (sweep){C.ENDC}: "
+                             f"{C.CYAN}{ip}{C.ENDC} (score {score})")
+
+        origins.sort(key=lambda o: (o["verified"], o["score"]), reverse=True)
+        findings[host] = {"cdn": cdn, "reference_marker": reference.get("marker"),
+                          "origins": origins}
+    return findings
+
+
 # --------------------------------------------------------------------------- #
 #  Fingerprint matching engine
 # --------------------------------------------------------------------------- #
@@ -816,6 +1613,7 @@ def analyse_host(session, host, ips, args):
         "host": host, "ips": ips, "open_ports": [], "services": {},
         "tls": None, "product": None, "vendor": None, "confidence": 0,
         "verdict": "not-vpn", "evidence": [], "cve_notes": [], "reverse_dns": {},
+        "cdn": None, "asn": None,
     }
     # Prefer an IPv4 address for scanning (broadest tool compatibility).
     ip = next((a for a in ips if ":" not in a), ips[0])
@@ -855,6 +1653,11 @@ def analyse_host(session, host, ips, args):
         if responses:
             break  # one working TLS port is enough for fingerprinting
     result["tls"] = cert
+
+    # CDN / WAF detection + ASN labelling of the primary IP.
+    resp_headers = responses[0]["headers"] if responses else None
+    result["cdn"] = detect_cdn(host, ips, resp_headers)
+    result["asn"] = ip_to_asn(ip)
 
     # Match fingerprints.
     fp, score, evidence = match_fingerprints(
@@ -917,6 +1720,13 @@ def print_host_report(res):
     bar = f"{color}{C.BOLD}[{label} | {res['confidence']}/100]{C.ENDC}"
     print(f"\n{C.PURPLE}{C.BOLD}=== {res['host']} ==={C.ENDC}  {bar}")
     print(f"  IPs           : {C.CYAN}{', '.join(res['ips'])}{C.ENDC}")
+    if res.get("asn"):
+        a = res["asn"]
+        print(f"  Network       : {C.DIM}AS{a['asn']} {a['org']} "
+              f"({a['cidr']} {a['cc']}){C.ENDC}")
+    if res.get("cdn"):
+        print(f"  CDN / WAF     : {C.YELLOW}{res['cdn']}{C.ENDC} "
+              f"{C.DIM}(edge IP - real origin hidden){C.ENDC}")
     for a, ptr in res["reverse_dns"].items():
         print(f"  Reverse DNS   : {C.CYAN}{a}{C.ENDC} -> {C.GREEN}{ptr}{C.ENDC}")
     if res["product"]:
@@ -948,12 +1758,59 @@ def print_host_report(res):
             print(f"    {C.RED}!{C.ENDC} {cve}")
 
 
-def write_json(path, target, results, meta):
+def print_origin_report(findings):
+    if not findings:
+        print(f"  {C.DIM}No CDN-fronted hosts required origin discovery.{C.ENDC}")
+        return
+    any_origin = False
+    for host, data in findings.items():
+        cdn = data.get("cdn") or "unknown"
+        origins = data.get("origins", [])
+        confirmed = [o for o in origins if o["verified"]]
+        print(f"\n  {C.BOLD}{host}{C.ENDC}  "
+              f"(behind {C.YELLOW}{cdn}{C.ENDC})")
+        if not origins:
+            print(f"    {C.DIM}no origin candidates verified.{C.ENDC}")
+            continue
+        for o in origins:
+            any_origin = True
+            tag = (f"{C.GREEN}{C.BOLD}CONFIRMED ORIGIN{C.ENDC}" if o["verified"]
+                   else f"{C.YELLOW}possible origin{C.ENDC}")
+            asn = o.get("asn")
+            org = f"  {C.DIM}AS{asn['asn']} {asn['org'][:34]}{C.ENDC}" if asn else ""
+            print(f"    {tag}: {C.CYAN}{C.BOLD}{o['ip']}{C.ENDC}"
+                  f"  [score {o['score']}]{org}")
+            print(f"        found via : {', '.join(o['methods'])}")
+            for reason in o["reasons"]:
+                print(f"        {C.GREEN}+{C.ENDC} {reason}")
+    if any_origin:
+        print(f"\n  {C.GREEN}{C.BOLD}>> Real IP address(es) recovered behind the "
+              f"CDN above.{C.ENDC}")
+
+
+def write_json(path, target, results, meta, origin_findings=None):
     payload = {"target": target, "meta": meta,
-               "results": [_strip_internal(r) for r in results]}
+               "results": [_strip_internal(r) for r in results],
+               "origin_discovery": origin_findings or {}}
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
     good(f"JSON report written to {C.CYAN}{path}{C.ENDC}")
+
+
+def write_origins_csv(path, findings):
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["host", "cdn", "origin_ip", "verified", "score",
+                    "asn", "asn_org", "methods", "reasons"])
+        for host, data in findings.items():
+            for o in data.get("origins", []):
+                asn = o.get("asn") or {}
+                w.writerow([
+                    host, data.get("cdn") or "", o["ip"], o["verified"],
+                    o["score"], asn.get("asn", ""), asn.get("org", ""),
+                    ";".join(o["methods"]), " | ".join(o["reasons"]),
+                ])
+    good(f"Origins CSV written to {C.CYAN}{path}{C.ENDC}")
 
 
 def _strip_internal(r):
@@ -993,7 +1850,7 @@ def print_banner():
 """
     print(f"{C.PURPLE}{banner}{C.ENDC}")
     print(f"{C.BOLD}VPN Finder v{SCRIPT_VERSION}{C.ENDC}  |  "
-          f"VPN gateway discovery & fingerprinting  |  "
+          f"VPN fingerprinting + CDN-bypass origin discovery  |  "
           f"by {C.YELLOW}{SCRIPT_AUTHORS}{C.ENDC}")
     print(C.DIM + "-" * 72 + C.ENDC)
 
@@ -1027,6 +1884,18 @@ def build_parser():
                    help="Also run ffuf HTTP fuzzing (if installed).")
     p.add_argument("--ffuf-options", default="",
                    help="Extra options passed through to ffuf.")
+
+    og = p.add_argument_group("origin / CDN-bypass")
+    og.add_argument("--no-origin", action="store_true",
+                    help="Disable origin-IP discovery for CDN-fronted hosts.")
+    og.add_argument("--force-origin", action="store_true",
+                    help="Hunt for an origin IP even when no CDN is detected.")
+    og.add_argument("--asn-sweep", action="store_true",
+                    help="Sweep the ASN/netblock around confirmed origins "
+                         "(heavier; verifies each neighbour).")
+    og.add_argument("--sweep-cap", type=int, default=1024,
+                    help="Max IPs to sweep from a single CIDR (default: 1024).")
+
     p.add_argument("-o", "--output",
                    help="Base path for output files (writes .json and .csv).")
     p.add_argument("--min-confidence", type=int, default=20,
@@ -1163,6 +2032,28 @@ def main():
             print(f"    {C.GREEN}*{C.ENDC} {C.BOLD}{r['host']}{C.ENDC} -> "
                   f"{prod} [{r['confidence']}/100]")
 
+    # --- Origin-IP discovery (CDN bypass) ---
+    origin_findings = {}
+    if not args.no_origin:
+        hunt_hosts = []
+        for h in [target, "www." + target]:
+            if h in resolved:
+                hunt_hosts.append(h)
+        for r in results:  # any host detected behind a CDN
+            if r.get("cdn") and r["host"] not in hunt_hosts:
+                hunt_hosts.append(r["host"])
+        if args.force_origin:
+            for h in ([target] + [r["host"] for r in results]):
+                if h not in hunt_hosts:
+                    hunt_hosts.append(h)
+        hunt_hosts = hunt_hosts[:8]  # keep the pass bounded
+
+        if hunt_hosts:
+            print(f"\n{C.PURPLE}{C.BOLD}{'=' * 20} ORIGIN DISCOVERY {'=' * 20}{C.ENDC}")
+            origin_findings = origin_discovery(
+                session, target, hunt_hosts, resolved, args)
+            print_origin_report(origin_findings)
+
     # --- Output files ---
     meta = {"version": SCRIPT_VERSION,
             "started": start.isoformat(),
@@ -1170,8 +2061,11 @@ def main():
             "hosts_resolved": len(resolved),
             "hosts_analysed": len(results)}
     if args.output:
-        write_json(args.output + ".json", target, results, meta)
+        write_json(args.output + ".json", target, results, meta,
+                   origin_findings)
         write_csv(args.output + ".csv", results)
+        if origin_findings:
+            write_origins_csv(args.output + ".origins.csv", origin_findings)
 
     duration = datetime.now(timezone.utc) - start
     print(f"\n{C.DIM}Completed in {duration}.{C.ENDC}")
