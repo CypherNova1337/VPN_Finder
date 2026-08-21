@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.json
+*.csv
+ffuf_results_*
+temp_vpn_wordlist_*

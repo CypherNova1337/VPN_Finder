@@ -1,1 +1,6 @@
-requests
+# Required
+requests>=2.20
+
+# Recommended: enables full TLS certificate parsing (CN, issuer, SANs).
+# The tool still runs without it, falling back to raw-certificate matching.
+cryptography>=3.0
